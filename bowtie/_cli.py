@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack
 from fnmatch import fnmatch
 from functools import wraps
 from pathlib import Path
@@ -14,7 +14,7 @@ import logging
 import os
 import sys
 
-from attrs import asdict
+from attrs import asdict, field, frozen
 from click.shell_completion import CompletionItem
 from diagnostic import DiagnosticError
 from jsonschema_lexer import JSONSchemaLexer
@@ -235,6 +235,45 @@ class ImplementationSubcommand(Protocol):
 SILENT = _report.Reporter(write=lambda **_: None)  # type: ignore[reportUnknownArgumentType])
 
 
+@frozen
+class Party:
+    """
+    A collection of implementations which will be run together.
+    """
+
+    _connectables: Iterable[_connectables.Connectable] = field(
+        alias="connectables",
+    )
+    _reporter: _report.Reporter = field(alias="reporter")
+
+    def __iter__(self):
+        return (each.to_terse() for each in self._connectables)
+
+    async def start(self):
+        exit_code = 0
+        successful = 0
+        async with AsyncExitStack() as stack:
+            for each in self._connectables:
+                try:
+                    implementation = await stack.enter_async_context(
+                        each.connect(
+                            reporter=self._reporter,
+                            make_validator=make_validator,
+                        ),
+                    )
+                except (NoSuchImplementation, StartupFailed) as error:
+                    exit_code |= EX.CONFIG
+                    STDERR.print(error)  # FIXME: respect --quiet
+                    continue
+
+                successful += 1
+                yield each, implementation
+
+                if not successful and default_implementations:
+                    # TODO: show a diagnostic that collects crash causes
+                    exit_code |= EX.CONFIG
+
+
 def implementation_subcommand(
     reporter: _report.Reporter = SILENT,
     default_implementations: Set[str] = Implementation.known(),
@@ -254,34 +293,8 @@ def implementation_subcommand(
             **kw: Any,
         ) -> int:
             exit_code = 0
-
-            async def start():
-                nonlocal exit_code
-
-                successful = 0
-                async with _start(
-                    image_names=image_names,
-                    make_validator=make_validator,
-                    reporter=reporter,
-                    read_timeout_sec=read_timeout_sec,
-                ) as implementations:
-                    for each in implementations:  # FIXME: respect --quiet
-                        try:
-                            implementation = await each
-                        except (NoSuchImplementation, StartupFailed) as error:
-                            exit_code |= EX.CONFIG
-                            STDERR.print(error)
-                            continue
-
-                        successful += 1
-                        yield implementation
-
-                    if not successful and default_implementations:
-                        # TODO: show a diagnostic that collects crash causes
-                        exit_code |= EX.CONFIG
-                        return
-
-            fn_exit_code = await fn(start=start, **kw)
+            party = Party(connectables=connectables, reporter=reporter)
+            fn_exit_code = await fn(party=party, **kw)
             return exit_code | (fn_exit_code or 0)
 
         @subcommand
@@ -1145,7 +1158,7 @@ KNOWN_LANGUAGES = {
 @click.pass_context
 async def filter_implementations(
     ctx: click.Context,
-    start: Callable[[], AsyncIterator[Implementation]],
+    party: Party,
     dialects: Sequence[Dialect],
     languages: Set[str],
 ):
@@ -1156,13 +1169,13 @@ async def filter_implementations(
     Bowtie commands.
     """
     if not dialects and languages == KNOWN_LANGUAGES:
-        for implementation in ctx.params.get("image_names", ()):
-            click.echo(implementation.removeprefix(f"{IMAGE_REPOSITORY}/"))
+        for each in party:
+            click.echo(each)
         return
 
-    async for each in start():
+    async for connectable, each in party.start():
         if each.supports(*dialects) and each.info.language in languages:
-            click.echo(each.name.removeprefix(f"{IMAGE_REPOSITORY}/"))
+            click.echo(connectable.to_terse())
 
 
 @implementation_subcommand(default_implementations=frozenset())  # type: ignore[reportArgumentType]
@@ -1195,7 +1208,7 @@ async def filter_implementations(
     ),
 )
 async def filter_dialects(
-    start: Callable[[], AsyncIterator[Implementation]],
+    party: Party,
     dialects: Iterable[Dialect],
     latest: bool,
     booleans: bool | None,
@@ -1212,7 +1225,7 @@ async def filter_dialects(
         if booleans is None or dialect.has_boolean_schemas == booleans
     }
 
-    async for implementation in start():
+    async for _, implementation in party.start():
         matching &= implementation.info.dialects
 
     if not matching:
@@ -1227,16 +1240,13 @@ async def filter_dialects(
 
 @implementation_subcommand()  # type: ignore[reportArgumentType]
 @format_option
-async def info(
-    start: Callable[[], AsyncIterator[Implementation]],
-    format: _F,
-):
+async def info(party: Party, format: _F):
     """
     Show information about a supported implementation.
     """
     serializable: dict[ImplementationId, dict[str, Any]] = {}
 
-    async for each in start():
+    async for _, each in party.start():
         metadata = [(k, v) for k, v in each.info.serializable().items() if v]
         metadata.sort(
             key=lambda kv: (
@@ -1287,17 +1297,13 @@ async def info(
     help="Don't print any output, just exit with nonzero status on failure.",
 )
 @format_option
-async def smoke(
-    start: Callable[[], AsyncIterator[Implementation]],
-    format: _F,
-    echo: Callable[..., None],
-) -> int:
+async def smoke(party: Party, format: _F, echo: Callable[..., None]) -> int:
     """
     Smoke test implementations for basic correctness against Bowtie's protocol.
     """
     exit_code = 0
 
-    async for implementation in start():
+    async for _, implementation in party.start():
         echo(f"Testing {implementation.name!r}...\n", file=sys.stderr)
         serializable: list[dict[str, Any]] = []
         implementation_exit_code = 0
@@ -1402,16 +1408,19 @@ async def _run(
     max_error: int | None = None,
     run_metadata: dict[str, Any] = {},
     reporter: _report.Reporter = _report.Reporter(),
+    make_validator: MakeValidator = make_validator,
     **kwargs: Any,
 ) -> int:
     exit_code = 0
     acknowledged: list[ImplementationInfo] = []
     runners: list[DialectRunner] = []
-    async with _start(
-        image_names=image_names,
-        reporter=reporter,
-        **kwargs,
-    ) as starting:
+    async with AsyncExitStack() as stack:
+        starting = [
+            stack.enter_async_context(
+                each.connect(reporter=reporter, make_validator=make_validator),
+            )
+            for each in connectables
+        ]
         for each in starting:
             try:
                 implementation = await each
@@ -1478,43 +1487,6 @@ async def _run(
         elif count > 1:  # XXX: Ugh, this should be removed when Reporter dies
             STDERR.print(f"Ran [green]{count}[/] test cases.")
     return exit_code
-
-
-@asynccontextmanager
-async def _start(
-    image_names: Iterable[str],
-    make_validator: MakeValidator,
-    read_timeout_sec: float,
-    **kwargs: Any,
-):
-    @asynccontextmanager
-    async def _client(
-        docker: Docker,
-        image_name: str,
-    ) -> AsyncIterator[Implementation]:
-        async with (
-            _containers.Connection.open(
-                docker=docker,
-                image_name=image_name,
-                read_timeout_sec=read_timeout_sec,
-            ) as connection,
-            Implementation.start(
-                id=image_name,
-                connection=connection,
-                make_validator=make_validator,
-                **kwargs,
-            ) as implementation,
-        ):
-            yield implementation
-
-    async with AsyncExitStack() as stack:
-        docker = await stack.enter_async_context(Docker())
-
-        implementations = [
-            stack.enter_async_context(_client(docker=docker, image_name=name))
-            for name in image_names
-        ]
-        yield asyncio.as_completed(implementations)
 
 
 def _stderr_processor(file: TextIO) -> structlog.typing.Processor:
