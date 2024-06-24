@@ -17,7 +17,7 @@ jobs:
         run: |
           printf 'dialects=%s\n' "$(jq -c '[.[].shortName]' data/dialects.json)" >> $GITHUB_OUTPUT
 
-  regenerate-reports:
+  regenerate-versioned-reports:
     needs: dialects
     runs-on: ubuntu-latest
     strategy:
@@ -31,26 +31,20 @@ jobs:
       - name: Install Bowtie
         uses: ./
 
-      - name: Generate a New Report
+      - name: Generate a New Versioned Report
+        id: generate-new-versioned-report
         run: |
           IMPLEMENTATIONS=$(bowtie filter-implementations --format json)
+          no_impl_started=false
           for impl in $(echo $IMPLEMENTATIONS | jq -r '.[]'); do
             matrix_versions_file="implementations/$impl/matrix-versions.json"
             if [ -f $matrix_versions_file ]; then
-              # Construct the bowtie command
-              cmd="bowtie suite"
-              for version in $(jq -r '.[]' "$matrix_versions_file"); do
-                cmd+=" -i image:$impl:$version"
-              done
-              cmd+=" https://github.com/json-schema-org/JSON-Schema-Test-Suite/tree/main/tests/${{ matrix.version }} > versioned-$impl-${{ matrix.version }}.json"
-              
-              # Run the command
-              eval $cmd
-              
-              # Delete the Docker images for this implementation
-              for version in $(jq -r '.[]' "$matrix_versions_file"); do
-                docker rmi "$impl:$version" || true
-              done
+              # Run bowtie suite
+              bowtie suite $(jq -r '.[]' "$matrix_versions_file" | sed "s/^/-i image:$impl:/") https://github.com/json-schema-org/JSON-Schema-Test-Suite/tree/main/tests/${{ matrix.version }} > $impl.json    
+
+              # Delete the multiple fetched docker images for the current implementation
+              # just so that we avoid running out of memory.
+              docker rmi $(jq -r '.[]' "$matrix_versions_file" | sed "s/^/ghcr.io\/bowtie-json-schema\/$impl:/") || true
             fi
           done
 
@@ -66,21 +60,16 @@ jobs:
         run: |
           IMPLEMENTATIONS=$(bowtie filter-implementations --format json)
           for impl in $(echo $IMPLEMENTATIONS | jq -r '.[]'); do
-            report_file="versioned-$impl-${{ matrix.version }}.json"
-            if [ -f "$report_file" ]; then
-              echo "Checking report for $impl (${{ matrix.version }}):"
-              if bowtie summary --show failures "$report_file" --format markdown >> $GITHUB_STEP_SUMMARY; then
-                echo "Report for $impl (${{ matrix.version }}) is valid."
-              else
-                echo "Error: Report for $impl (${{ matrix.version }}) is invalid."
-                exit 1
-              fi
+            if [ -f "$impl.json" ]; then
+              bowtie summary --show failures "$impl.json" --format markdown >> $GITHUB_STEP_SUMMARY
             else
-              echo "Warning: Report file $report_file not found. Skipping."
+              echo 'Warning: Report file "$impl.json" not found. Skipping.'
             fi
           done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: reports-${{ matrix.version }}
-          path: versioned-*-${{ matrix.version }}.json
+          name: versioned-report-${{ matrix.version }}
+          path: |
+            *.json
+            !.prettierrc.json
