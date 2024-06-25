@@ -88,14 +88,22 @@ jobs:
 
       - name: Generate public-implementations (Public API) file
         run: |
-          bowtie info $(bowtie filter-implementations | sed 's/^/-i /') --format json | \
-          jq 'to_entries | map({
-              (.value.source): (
-                .value + {name: .key}
-                | del(.os, .os_version, .language_version, .source)
-              )
-            })
-            | add' > public-implementations
+          bowtie filter-implementations | \
+            while read -r impl; do
+              bowtie info -i $impl --format json | \
+              jq --arg impl "$impl" '
+                {(.source): (
+                  . + {name: $impl}
+                  | del(
+                      .os,
+                      .os_version,
+                      .langage_version,
+                      .source
+                    )
+                )}
+              '
+            done | \
+          jq -s 'add' > public-implementations
 
       - uses: actions/upload-artifact@v4
         with:
