@@ -97,13 +97,15 @@ jobs:
                   | del(
                       .os,
                       .os_version,
-                      .langage_version,
                       .source
                     )
                 )}
               '
             done | \
           jq -s 'add' > public-implementations
+
+      - name: Validate public-implementations against a JSON Schema
+        run: bowtie validate -i python-jsonschema bowtie/schemas/models/public-implementations.json public-implementations
 
       - uses: actions/upload-artifact@v4
         with:
