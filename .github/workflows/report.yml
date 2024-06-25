@@ -86,7 +86,7 @@ jobs:
         run: |
           bowtie info $(bowtie filter-implementations | sed 's/^/-i /') --format json > implementations.json
 
-      - name: Generate implementations (Public API) file
+      - name: Generate public-implementations (Public API) file
         run: |
           bowtie info $(bowtie filter-implementations | sed 's/^/-i /') --format json | \
           jq 'to_entries | map({
@@ -95,17 +95,17 @@ jobs:
                 | del(.os, .os_version, .language_version, .source)
               )
             })
-            | add' > implementations
+            | add' > public-implementations
 
       - uses: actions/upload-artifact@v4
         with:
-          name: private-implementations
+          name: implementations
           path: implementations.json
 
       - uses: actions/upload-artifact@v4
         with:
           name: public-implementations
-          path: implementations
+          path: public-implementations
 
   site:
     needs:
@@ -133,7 +133,7 @@ jobs:
       - name: Include Implementation Metadata
         uses: actions/download-artifact@v4
         with:
-          name: private-implementations
+          name: implementations
           path: site/
 
       - name: Create a Public Directory Structure for JSON Schema Org
@@ -144,6 +144,9 @@ jobs:
         with:
           name: public-implementations
           path: site/v1/json-schema-org/
+
+      - name: Rename "public-implementations" file to just "implementations"
+        run: mv site/v1/json-schema-org/public-implementations site/v1/json-schema-org/implementations
 
       - name: Generate Badges
         run: bowtie badges
