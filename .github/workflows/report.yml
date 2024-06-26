@@ -96,6 +96,7 @@ jobs:
                   . + {name: $impl}
                   | del(
                       .os,
+                      .os_version,
                       .source
                     )
                 )}
